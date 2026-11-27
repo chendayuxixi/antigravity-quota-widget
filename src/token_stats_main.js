@@ -6,6 +6,7 @@
 
     const CHANNEL = 'ag-token-stats:get';
     const QUOTA_CHANNEL = 'ag-quota:get';
+    const STATUS_CHANNEL = 'ag-status:get';
 
     function readVarint(buf, pos) {
         let val = 0;
@@ -70,7 +71,7 @@
         return out;
     }
 
-    // gen_metadata: 2 = packed step indices, 1 = chat model metadata { 4 = usage {1 input, 2 cache read, 3 output}, 19 model id, 21 model label }
+    // gen_metadata: 2 = packed step indices, 1 = chat model metadata { 4 = usage {1 input, 2 cache read, 3 output}, 9 = { 10 = { 1 ctxUsed, 4 ctxLimit } }, 19 model id, 21 model label }
     function parseGenMetadata(buf) {
         const top = decodeFields(buf);
         const stepBytes = firstBytes(top, 2);
@@ -81,13 +82,28 @@
         const usageBytes = firstBytes(mf, 4);
         if (!usageBytes) return null;
         const uf = decodeFields(usageBytes);
+        let ctxUsed = 0;
+        let ctxLimit = 0;
+        try {
+            const f9 = firstBytes(mf, 9);
+            if (f9) {
+                const f10 = firstBytes(decodeFields(f9), 10);
+                if (f10) {
+                    const cf = decodeFields(f10);
+                    ctxUsed = firstVarint(cf, 1);
+                    ctxLimit = firstVarint(cf, 4);
+                }
+            }
+        } catch (_e) {}
         const labelBytes = firstBytes(mf, 21) || firstBytes(mf, 19);
         return {
             steps,
             model: labelBytes ? Buffer.from(labelBytes).toString('utf8') : 'unknown',
             input: firstVarint(uf, 1),
             cacheRead: firstVarint(uf, 2),
-            output: firstVarint(uf, 3)
+            output: firstVarint(uf, 3),
+            ctxUsed,
+            ctxLimit
         };
     }
 
@@ -144,11 +160,12 @@
         const titles = loadTitles(DatabaseSync, baseDir);
         const events = [];
         const errors = [];
+        let latestContext = null;
         let files = [];
         try {
             files = fs.readdirSync(convDir).filter(f => f.endsWith('.db'));
         } catch (e) {
-            return { ok: false, error: `cannot read ${convDir}: ${e.message}`, events, generatedAt: Date.now() };
+            return { ok: false, error: `cannot read ${convDir}: ${e.message}`, events, latestContext: null, generatedAt: Date.now() };
         }
         for (const f of files) {
             const convId = f.slice(0, -3);
@@ -179,7 +196,9 @@
                         model: g.model,
                         input: g.input,
                         cacheRead: g.cacheRead,
-                        output: g.output
+                        output: g.output,
+                        ctxUsed: g.ctxUsed || 0,
+                        ctxLimit: g.ctxLimit || 0
                     };
                     if (!ts) pendingNoTs.push(ev);
                     events.push(ev);
@@ -198,10 +217,55 @@
                 }
             }
         }
-        return { ok: true, events, errors, files: files.length, generatedAt: Date.now() };
+        for (const ev of events) {
+            if (ev.ctxUsed > 0 && ev.ctxLimit > 0 && (!latestContext || ev.ts >= latestContext.ts)) {
+                latestContext = {
+                    used: ev.ctxUsed,
+                    limit: ev.ctxLimit,
+                    model: ev.model,
+                    conv: ev.conv,
+                    title: ev.title,
+                    ts: ev.ts
+                };
+            }
+        }
+        return { ok: true, events, latestContext, errors, files: files.length, generatedAt: Date.now() };
+    }
+
+    function collectRunStatus(baseDirOverride) {
+        const { DatabaseSync } = require('node:sqlite');
+        const baseDir = baseDirOverride || path.join(os.homedir(), '.gemini', 'antigravity');
+        const file = path.join(baseDir, 'conversation_summaries.db');
+        if (!fs.existsSync(file)) return { ok: true, conversations: [] };
+        let handle;
+        try {
+            handle = openReadOnly(DatabaseSync, file);
+            const rows = handle.db.prepare(
+                'SELECT conversation_id, title, status, not_fully_idle, last_modified_time FROM conversation_summaries WHERE IFNULL(nesting_depth, 0) = 0 ORDER BY last_modified_time DESC LIMIT 5'
+            ).all();
+            return {
+                ok: true,
+                conversations: rows.map(r => ({
+                    id: r.conversation_id,
+                    title: r.title || '',
+                    status: r.status || '',
+                    running: Boolean(r.not_fully_idle) || /RUNNING/i.test(String(r.status || '')),
+                    waiting: /WAIT/i.test(String(r.status || '')),
+                    updatedAt: r.last_modified_time || ''
+                }))
+            };
+        } catch (e) {
+            return { ok: false, error: String(e && e.message || e), conversations: [] };
+        } finally {
+            if (handle) {
+                try { handle.db.close(); } catch (_e) {}
+                if (handle.tmpDir) try { fs.rmSync(handle.tmpDir, { recursive: true, force: true }); } catch (_e) {}
+            }
+        }
     }
 
     globalThis.__agCollectTokenStats = collectTokenStats;
+    globalThis.__agCollectRunStatus = collectRunStatus;
 
     function getLanguageServerModule() {
         if (globalThis.__agLsOverride) return globalThis.__agLsOverride;
@@ -297,6 +361,14 @@
                 writeDiag(`quota error ${res.error}`);
             }
             return res;
+        });
+        electron.ipcMain.removeHandler(STATUS_CHANNEL);
+        electron.ipcMain.handle(STATUS_CHANNEL, () => {
+            try {
+                return collectRunStatus();
+            } catch (e) {
+                return { ok: false, error: String(e && e.message || e), conversations: [] };
+            }
         });
         writeDiag('handlers registered');
     } catch (e) {
